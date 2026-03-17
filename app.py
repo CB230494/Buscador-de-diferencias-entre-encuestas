@@ -14,7 +14,6 @@ from pypdf import PdfReader
 from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import inch
 from reportlab.platypus import (
     SimpleDocTemplate,
     Paragraph,
@@ -22,7 +21,6 @@ from reportlab.platypus import (
     Table,
     TableStyle,
     KeepTogether,
-    PageBreak,
 )
 
 st.set_page_config(page_title="Comparador de Formularios PDF", layout="wide")
@@ -235,10 +233,7 @@ def is_question_line(line: str) -> bool:
         return False
 
     q_text = m.group(2).strip()
-    if len(q_text) < 3:
-        return False
-
-    return True
+    return len(q_text) >= 3
 
 
 def looks_like_option(line: str) -> bool:
@@ -440,7 +435,7 @@ def compare_questions(orig_questions: list[dict], new_questions: list[dict]) -> 
 
 
 # =========================================================
-# REPORTE PDF
+# PDF
 # =========================================================
 def build_detailed_pdf(report_rows: list[dict]) -> bytes:
     buffer = io.BytesIO()
@@ -482,7 +477,7 @@ def build_detailed_pdf(report_rows: list[dict]) -> bytes:
         fontName="Helvetica-Bold",
         fontSize=13,
         leading=16,
-        spaceBefore=6,
+        spaceBefore=8,
         spaceAfter=6,
     )
 
@@ -514,8 +509,8 @@ def build_detailed_pdf(report_rows: list[dict]) -> bytes:
         leading=12,
         leftIndent=8,
         rightIndent=4,
-        spaceBefore=2,
-        spaceAfter=2,
+        spaceBefore=1,
+        spaceAfter=1,
         wordWrap="CJK",
     )
 
@@ -563,41 +558,36 @@ def build_detailed_pdf(report_rows: list[dict]) -> bytes:
     story.append(Spacer(1, 14))
 
     for idx, row in enumerate(report_rows, start=1):
-        bloque_archivo = []
-
-        bloque_archivo.append(Paragraph(f"{idx}. {safe_text(row['archivo'])}", style_h2))
-        bloque_archivo.append(Paragraph(
+        # Encabezado del archivo SIN forzar salto
+        story.append(Paragraph(f"{idx}. {safe_text(row['archivo'])}", style_h2))
+        story.append(Paragraph(
             f"<b>Tipo:</b> {safe_text(row['tipo'])} &nbsp;&nbsp;&nbsp; "
             f"<b>Delegación:</b> {safe_text(row['delegacion'])} &nbsp;&nbsp;&nbsp; "
             f"<b>Total de cambios:</b> {row['total_cambios']}",
             style_meta
         ))
-        bloque_archivo.append(Spacer(1, 4))
+        story.append(Spacer(1, 4))
 
         if row["error"]:
-            bloque_archivo.append(Paragraph(f"<b>Error:</b> {safe_text(row['error'])}", style_box))
-            story.append(KeepTogether(bloque_archivo))
-            if idx < len(report_rows):
-                story.append(PageBreak())
+            story.append(Paragraph(f"<b>Error:</b> {safe_text(row['error'])}", style_box))
+            story.append(Spacer(1, 10))
             continue
 
         if not row["cambios"]:
-            bloque_archivo.append(
-                Paragraph("No se detectaron cambios sustantivos en preguntas u opciones.", style_box)
-            )
-            story.append(KeepTogether(bloque_archivo))
-            if idx < len(report_rows):
-                story.append(PageBreak())
+            story.append(Paragraph(
+                "No se detectaron cambios sustantivos en preguntas u opciones.",
+                style_box
+            ))
+            story.append(Spacer(1, 10))
             continue
 
         for item in row["cambios"]:
-            bloque_pregunta = []
-            bloque_pregunta.append(Paragraph(safe_text(item["question_label"]), style_h3))
+            bloque_pregunta = [Paragraph(safe_text(item["question_label"]), style_h3)]
 
             if item["change_kind"] in ("pregunta_agregada", "pregunta_eliminada"):
                 bloque_pregunta.append(Paragraph(safe_text(item["detail"]), style_box))
                 bloque_pregunta.append(Spacer(1, 4))
-                bloque_archivo.append(KeepTogether(bloque_pregunta))
+                story.append(KeepTogether(bloque_pregunta))
                 continue
 
             for ch in item["changes"]:
@@ -607,7 +597,7 @@ def build_detailed_pdf(report_rows: list[dict]) -> bytes:
                         Paragraph(f"<b>Original:</b> {safe_text(ch['antes'])}", style_box),
                         Paragraph(f"<b>Nuevo:</b> {safe_text(ch['despues'])}", style_box),
                     ]
-                    bloque_pregunta.append(KeepTogether(sub_bloque))
+                    story.append(KeepTogether(sub_bloque))
 
                 elif ch["type"] == "opcion_agregada":
                     bloque_pregunta.append(
@@ -625,15 +615,15 @@ def build_detailed_pdf(report_rows: list[dict]) -> bytes:
                         Paragraph(f"<b>Antes:</b> {safe_text(ch['antes'])}", style_box),
                         Paragraph(f"<b>Después:</b> {safe_text(ch['despues'])}", style_box),
                     ]
-                    bloque_pregunta.append(KeepTogether(sub_bloque))
+                    story.append(KeepTogether(bloque_pregunta))
+                    bloque_pregunta = []
+                    story.append(KeepTogether(sub_bloque))
 
-            bloque_pregunta.append(Spacer(1, 5))
-            bloque_archivo.append(KeepTogether(bloque_pregunta))
+            if bloque_pregunta:
+                bloque_pregunta.append(Spacer(1, 5))
+                story.append(KeepTogether(bloque_pregunta))
 
-        story.append(KeepTogether(bloque_archivo))
-
-        if idx < len(report_rows):
-            story.append(PageBreak())
+        story.append(Spacer(1, 10))
 
     doc.build(story)
     pdf = buffer.getvalue()
@@ -642,7 +632,7 @@ def build_detailed_pdf(report_rows: list[dict]) -> bytes:
 
 
 # =========================================================
-# LÓGICA DE ARMADO
+# LÓGICA
 # =========================================================
 def build_reference_map(files: list) -> dict:
     ref_map = {}
