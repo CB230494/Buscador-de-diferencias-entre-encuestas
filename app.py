@@ -70,12 +70,6 @@ def safe_text(text: str) -> str:
 
 
 def clean_question_artifacts(text: str) -> str:
-    """
-    Limpia residuos típicos del PDF:
-    - 'pregunta 33.1'
-    - '14.1.'
-    - referencias pegadas al final
-    """
     text = safe_text(text)
 
     patterns = [
@@ -93,8 +87,50 @@ def clean_question_artifacts(text: str) -> str:
 
 
 # =========================================================
-# FILTRO DE RUIDO
+# FILTRO DE RUIDO MÁS ESTRICTO
 # =========================================================
+NOISE_PREFIXES = [
+    "nota:",
+    "nota.",
+    "nota previa",
+    "nota condicional",
+    "nota metodologica",
+    "nota metodológica",
+    "logica condicional",
+    "lógica condicional",
+    "si la respuesta es",
+    "si respondió",
+    "si respondio",
+    "en caso de responder",
+    "en caso de que",
+    "al continuar",
+    "consentimiento informado",
+    "estrategia sembremos seguridad",
+    "fin de la encuesta",
+    "datos generales de caracter estadistico",
+    "datos generales de carácter estadístico",
+    "informacion adicional y contacto voluntario",
+    "información adicional y contacto voluntario",
+    "propuestas ciudadanas para la mejora de la seguridad",
+    "confianza policial",
+    "delitos",
+    "victimizacion",
+    "victimización",
+    "riesgos sociales y situacionales",
+    "contexto territorial y problematicas",
+    "contexto territorial y problemáticas",
+    "informacion de condiciones institucionales",
+    "información de condiciones institucionales",
+    "apartado a:",
+    "apartado b:",
+    "instrucciones:",
+    "instruccion:",
+    "instrucción:",
+    "observacion:",
+    "observación:",
+]
+
+
 def is_noise_line(line: str) -> bool:
     raw = safe_text(line)
     if not raw:
@@ -102,38 +138,13 @@ def is_noise_line(line: str) -> bool:
 
     low = clean_for_compare(raw)
 
-    noise_prefixes = [
-        "nota:",
-        "nota.",
-        "nota previa",
-        "nota condicional",
-        "logica condicional",
-        "lógica condicional",
-        "consentimiento informado",
-        "estrategia sembremos seguridad",
-        "fin de la encuesta",
-        "datos generales de caracter estadistico",
-        "datos generales de carácter estadístico",
-        "informacion adicional y contacto voluntario",
-        "información adicional y contacto voluntario",
-        "propuestas ciudadanas para la mejora de la seguridad",
-        "confianza policial",
-        "delitos",
-        "victimizacion",
-        "victimización",
-        "riesgos sociales y situacionales",
-        "contexto territorial y problematicas",
-        "contexto territorial y problemáticas",
-        "informacion de condiciones institucionales",
-        "información de condiciones institucionales",
-        "apartado a:",
-        "apartado b:",
-    ]
-
-    if any(low.startswith(x) for x in noise_prefixes):
+    if any(low.startswith(x) for x in NOISE_PREFIXES):
         return True
 
     if re.fullmatch(r"\d+", low):
+        return True
+
+    if re.fullmatch(r"\d{1,2}(?:\.\d+)?\.?", raw.strip()):
         return True
 
     if len(raw) < 90 and raw.isupper() and "?" not in raw:
@@ -150,6 +161,8 @@ def normalize_option_text(text: str) -> str:
     text = re.sub(r"^☐\s*", "", text)
     text = re.sub(r"^\(\s*\)\s*", "", text)
     text = re.sub(r"^\-\s*", "", text)
+    text = re.sub(r"^\d+\)\s*", "", text)
+    text = re.sub(r"^[a-zA-Z]\)\s*", "", text)
     text = re.sub(r"\s+", " ", text).strip(" .;:")
     return text.strip()
 
@@ -203,33 +216,18 @@ def detect_delegacion(text: str, filename: str = "") -> str:
 # =========================================================
 # PARSER DE PREGUNTAS Y OPCIONES
 # =========================================================
-QUESTION_RE = re.compile(r"^\s*(\d{1,2}(?:\.\d+)?)[\.\-–]?\s*(.+)$")
+QUESTION_RE = re.compile(r"^\s*(\d{1,2}(?:\.\d+)?)[\.\-–]?\s+(.+)$")
 
 OPTION_HINT_WORDS = [
-    "si",
-    "no",
-    "sí",
-    "muy inseguro",
-    "inseguro",
-    "seguro",
-    "muy seguro",
-    "nunca",
-    "casi nunca",
-    "todos los dias",
-    "todos los días",
-    "varias veces",
-    "una vez",
-    "otro",
-    "otra",
-    "no aplica",
-    "desconocido",
-    "arma",
-    "hurto",
-    "robo",
-    "asalto",
-    "estafa",
-    "extorsion",
-    "extorsión",
+    "si", "sí", "no", "tal vez",
+    "muy inseguro", "inseguro", "seguro", "muy seguro",
+    "nunca", "casi nunca", "a veces", "frecuentemente", "siempre",
+    "todos los dias", "todos los días", "varias veces", "una vez",
+    "otro", "otra", "no aplica", "desconocido",
+    "arma", "hurto", "robo", "asalto", "estafa", "extorsion", "extorsión",
+    "hombre", "mujer",
+    "mucho", "poco", "nada",
+    "excelente", "bueno", "regular", "malo", "muy malo",
 ]
 
 
@@ -259,8 +257,28 @@ def is_question_line(line: str) -> bool:
     if not m:
         return False
 
-    q_text = m.group(2).strip()
-    return len(q_text) >= 3
+    q_text = safe_text(m.group(2))
+
+    if len(q_text) < 5:
+        return False
+
+    low = clean_for_compare(q_text)
+
+    if any(low.startswith(x) for x in NOISE_PREFIXES):
+        return False
+
+    return True
+
+
+def has_option_marker(raw: str) -> bool:
+    raw = raw.strip()
+    return bool(
+        raw.startswith(("☐", "•", "●", "▪", "◦", "-", "–"))
+        or re.match(r"^\(\s*\)\s*", raw)
+        or re.match(r"^[oO]\s+", raw)
+        or re.match(r"^\d+\)\s*", raw)
+        or re.match(r"^[a-zA-Z]\)\s*", raw)
+    )
 
 
 def looks_like_option(line: str) -> bool:
@@ -269,15 +287,51 @@ def looks_like_option(line: str) -> bool:
 
     raw = line.strip()
     low = clean_for_compare(raw)
+    norm = normalize_option_text(raw)
+    norm_low = clean_for_compare(norm)
 
-    if raw.startswith(("☐", "•", "●", "▪", "◦")):
-        return True
-    if re.match(r"^\(\s*\)\s*", raw):
-        return True
-    if re.match(r"^[oO]\s+", raw):
+    if not norm:
+        return False
+
+    if has_option_marker(raw):
         return True
 
-    if len(raw) <= 140 and any(word in low for word in OPTION_HINT_WORDS):
+    # Opciones cortas típicas
+    if len(norm) <= 40 and norm_low in [clean_for_compare(x) for x in OPTION_HINT_WORDS]:
+        return True
+
+    # Opciones cortas que contienen frases típicas
+    if len(norm) <= 60 and any(word == norm_low or word in norm_low for word in OPTION_HINT_WORDS):
+        return True
+
+    # Respuestas cerradas cortas
+    if len(norm.split()) <= 4 and len(norm) <= 35:
+        common_closed_answers = {
+            "si", "sí", "no", "tal vez", "nunca", "siempre", "a veces",
+            "muy seguro", "seguro", "inseguro", "muy inseguro",
+            "bueno", "regular", "malo", "excelente", "muy malo",
+            "otro", "otra", "no aplica"
+        }
+        if norm_low in common_closed_answers:
+            return True
+
+    return False
+
+
+def should_stop_collecting_options(line: str) -> bool:
+    raw = safe_text(line)
+    if not raw:
+        return True
+
+    low = clean_for_compare(raw)
+
+    if is_noise_line(raw):
+        return True
+
+    if is_question_line(raw):
+        return True
+
+    if any(low.startswith(x) for x in NOISE_PREFIXES):
         return True
 
     return False
@@ -306,22 +360,19 @@ def parse_questions(text: str) -> list[dict]:
         if current is None:
             continue
 
-        if is_noise_line(line):
+        if should_stop_collecting_options(line):
             continue
 
+        # SOLO opciones.
+        # Ya no se concatenan líneas libres a la pregunta.
         if looks_like_option(line):
             opt = normalize_option_text(line)
             if opt:
                 current["options"].append(opt)
             continue
 
-        low = clean_for_compare(line)
-        if not low.startswith(("nota", "logica", "lógica", "si la respuesta", "en caso de", "al continuar")):
-            if len(line) < 220:
-                if not re.fullmatch(r"\d{1,2}(?:\.\d+)?\.?", line.strip()):
-                    current["question"] = clean_question_artifacts(
-                        safe_text(current["question"] + " " + line)
-                    )
+        # Si no es opción, se ignora totalmente.
+        # Esto evita tomar notas, observaciones o instrucciones como cambios.
 
     cleaned = []
     for q in questions:
@@ -379,7 +430,7 @@ def compare_options(orig_opts: list[str], new_opts: list[str]) -> list[dict]:
                 best_score = sc
                 best_j = j
 
-        if best_j is not None and best_score >= 0.60:
+        if best_j is not None and best_score >= 0.75:
             changes.append({
                 "type": "opcion_modificada",
                 "antes": rem,
@@ -809,7 +860,6 @@ def auto_adjust_width(ws, min_width=12, max_width=45):
 def style_sheet(ws, title: str, header_row: int, data_start_row: int):
     blue_fill = PatternFill("solid", fgColor="1F4E79")
     light_blue_fill = PatternFill("solid", fgColor="D9EAF7")
-    white_font = Font(color="FFFFFF", bold=True)
     dark_font = Font(color="000000", bold=True)
     thin = Side(style="thin", color="B7B7B7")
 
@@ -896,9 +946,6 @@ def build_excel_report(report_rows: list[dict]) -> bytes:
 
     wb = Workbook()
 
-    # -----------------------------------------------------
-    # Hoja Resumen
-    # -----------------------------------------------------
     ws1 = wb.active
     ws1.title = "Resumen General"
 
@@ -925,9 +972,6 @@ def build_excel_report(report_rows: list[dict]) -> bytes:
     ws1.row_dimensions[1].height = 24
     ws1.row_dimensions[2].height = 36
 
-    # -----------------------------------------------------
-    # Hoja Detalle
-    # -----------------------------------------------------
     ws2 = wb.create_sheet("Detalle de Cambios")
 
     detalle_title = "Reporte comparativo de preguntas y opciones - Detalle de cambios"
@@ -956,7 +1000,6 @@ def build_excel_report(report_rows: list[dict]) -> bytes:
     ws2.row_dimensions[1].height = 24
     ws2.row_dimensions[2].height = 42
 
-    # Anchos específicos útiles
     custom_widths = {
         "A": 28,
         "B": 16,
@@ -973,9 +1016,6 @@ def build_excel_report(report_rows: list[dict]) -> bytes:
     for col, width in custom_widths.items():
         ws2.column_dimensions[col].width = width
 
-    # -----------------------------------------------------
-    # Hoja Notas
-    # -----------------------------------------------------
     ws3 = wb.create_sheet("Notas")
 
     ws3.merge_cells("A1:D1")
@@ -1011,9 +1051,6 @@ def build_excel_report(report_rows: list[dict]) -> bytes:
     ws3.column_dimensions["C"].width = 20
     ws3.column_dimensions["D"].width = 28
 
-    # -----------------------------------------------------
-    # Guardar
-    # -----------------------------------------------------
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)
