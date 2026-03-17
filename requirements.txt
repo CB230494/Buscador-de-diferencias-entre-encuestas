@@ -1,6 +1,6 @@
 streamlit
-pymupdf
+pandas
 pypdf
-rapidfuzz
 reportlab
+openpyxl
 
