@@ -65,6 +65,29 @@ def safe_text(text: str) -> str:
     return re.sub(r"\s+", " ", str(text)).strip()
 
 
+def clean_question_artifacts(text: str) -> str:
+    """
+    Limpia residuos típicos del PDF:
+    - 'pregunta 33.1'
+    - '14.1.'
+    - referencias pegadas al final
+    """
+    text = safe_text(text)
+
+    patterns = [
+        r"\b[pP]regunta\s+\d{1,2}(?:\.\d+)?\.?$",
+        r"\b\d{1,2}(?:\.\d+)?\.?$",
+        r"\.\s*\d{1,2}(?:\.\d+)?\.?$",
+    ]
+    prev = None
+    while prev != text:
+        prev = text
+        for pat in patterns:
+            text = re.sub(pat, "", text).strip()
+
+    return safe_text(text)
+
+
 # =========================================================
 # FILTRO DE RUIDO
 # =========================================================
@@ -270,7 +293,7 @@ def parse_questions(text: str) -> list[dict]:
 
             current = {
                 "num": q_num,
-                "question": q_text,
+                "question": clean_question_artifacts(q_text),
                 "options": []
             }
             questions.append(current)
@@ -291,11 +314,15 @@ def parse_questions(text: str) -> list[dict]:
         low = clean_for_compare(line)
         if not low.startswith(("nota", "logica", "lógica", "si la respuesta", "en caso de", "al continuar")):
             if len(line) < 220:
-                current["question"] = safe_text(current["question"] + " " + line)
+                # No concatenar líneas que parecen otra referencia de pregunta
+                if not re.fullmatch(r"\d{1,2}(?:\.\d+)?\.?", line.strip()):
+                    current["question"] = clean_question_artifacts(
+                        safe_text(current["question"] + " " + line)
+                    )
 
     cleaned = []
     for q in questions:
-        q_text = safe_text(q["question"])
+        q_text = clean_question_artifacts(q["question"])
         opts = []
         seen = set()
 
@@ -414,8 +441,8 @@ def compare_questions(orig_questions: list[dict], new_questions: list[dict]) -> 
         if q_sim < 0.97:
             q_changes.append({
                 "type": "texto_pregunta_modificado",
-                "antes": oq["question"],
-                "despues": nq["question"]
+                "antes": clean_question_artifacts(oq["question"]),
+                "despues": clean_question_artifacts(nq["question"])
             })
 
         opt_changes = compare_options(oq["options"], nq["options"])
@@ -558,7 +585,6 @@ def build_detailed_pdf(report_rows: list[dict]) -> bytes:
     story.append(Spacer(1, 14))
 
     for idx, row in enumerate(report_rows, start=1):
-        # Encabezado del archivo SIN forzar salto
         story.append(Paragraph(f"{idx}. {safe_text(row['archivo'])}", style_h2))
         story.append(Paragraph(
             f"<b>Tipo:</b> {safe_text(row['tipo'])} &nbsp;&nbsp;&nbsp; "
@@ -582,22 +608,25 @@ def build_detailed_pdf(report_rows: list[dict]) -> bytes:
             continue
 
         for item in row["cambios"]:
-            bloque_pregunta = [Paragraph(safe_text(item["question_label"]), style_h3)]
+            bloque_pregunta = [
+                Paragraph(safe_text(item["question_label"]), style_h3)
+            ]
 
             if item["change_kind"] in ("pregunta_agregada", "pregunta_eliminada"):
                 bloque_pregunta.append(Paragraph(safe_text(item["detail"]), style_box))
-                bloque_pregunta.append(Spacer(1, 4))
+                bloque_pregunta.append(Spacer(1, 5))
                 story.append(KeepTogether(bloque_pregunta))
                 continue
 
             for ch in item["changes"]:
                 if ch["type"] == "texto_pregunta_modificado":
-                    sub_bloque = [
-                        Paragraph("<b>Texto modificado</b>", style_box),
-                        Paragraph(f"<b>Original:</b> {safe_text(ch['antes'])}", style_box),
-                        Paragraph(f"<b>Nuevo:</b> {safe_text(ch['despues'])}", style_box),
-                    ]
-                    story.append(KeepTogether(sub_bloque))
+                    bloque_pregunta.append(Paragraph("<b>Texto modificado</b>", style_box))
+                    bloque_pregunta.append(
+                        Paragraph(f"<b>Original:</b> {safe_text(ch['antes'])}", style_box)
+                    )
+                    bloque_pregunta.append(
+                        Paragraph(f"<b>Nuevo:</b> {safe_text(ch['despues'])}", style_box)
+                    )
 
                 elif ch["type"] == "opcion_agregada":
                     bloque_pregunta.append(
@@ -615,13 +644,10 @@ def build_detailed_pdf(report_rows: list[dict]) -> bytes:
                         Paragraph(f"<b>Antes:</b> {safe_text(ch['antes'])}", style_box),
                         Paragraph(f"<b>Después:</b> {safe_text(ch['despues'])}", style_box),
                     ]
-                    story.append(KeepTogether(bloque_pregunta))
-                    bloque_pregunta = []
-                    story.append(KeepTogether(sub_bloque))
+                    bloque_pregunta.extend(sub_bloque)
 
-            if bloque_pregunta:
-                bloque_pregunta.append(Spacer(1, 5))
-                story.append(KeepTogether(bloque_pregunta))
+            bloque_pregunta.append(Spacer(1, 6))
+            story.append(KeepTogether(bloque_pregunta))
 
         story.append(Spacer(1, 10))
 
@@ -765,7 +791,7 @@ if compare_btn:
 
             for ch in item["changes"]:
                 if ch["type"] == "texto_pregunta_modificado":
-                    st.info("**Texto de la pregunta modificado**")
+                    st.info("Texto de la pregunta modificado")
                     st.write(f"**Original:** {ch['antes']}")
                     st.write(f"**Nuevo:** {ch['despues']}")
 
@@ -776,7 +802,7 @@ if compare_btn:
                     st.error(f"**Opción eliminada:** {ch['texto']}")
 
                 elif ch["type"] == "opcion_modificada":
-                    st.warning("**Opción modificada**")
+                    st.warning("Opción modificada")
                     st.write(f"**Antes:** {ch['antes']}")
                     st.write(f"**Después:** {ch['despues']}")
 
