@@ -1,667 +1,728 @@
+# app.py
 # -*- coding: utf-8 -*-
 
 import io
 import re
-import html
 import unicodedata
-from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Dict, List, Tuple
 
-import fitz  # PyMuPDF
 import streamlit as st
+import pandas as pd
 from pypdf import PdfReader
-from rapidfuzz import fuzz
 
-from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
 from reportlab.lib.units import inch
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+    PageBreak
+)
 
 st.set_page_config(page_title="Comparador de Formularios PDF", layout="wide")
 
 
 # =========================================================
-# Utilidades
+# UTILIDADES
 # =========================================================
-
 def strip_accents(text: str) -> str:
-    text = unicodedata.normalize("NFD", text or "")
+    if text is None:
+        return ""
+    text = unicodedata.normalize("NFD", text)
     return "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
 
 
-def norm(text: str) -> str:
+def normalize_spaces(text: str) -> str:
     if text is None:
         return ""
-    text = str(text).replace("\ufeff", " ").replace("\xa0", " ")
     text = text.replace("\r", "\n")
-    text = text.replace("•", "\n• ").replace("☐", "\n☐ ").replace("□", "\n□ ")
     text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{2,}", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
-def normalize_for_compare(text: str) -> str:
-    text = norm(text).lower()
-    text = strip_accents(text)
-    text = text.replace("¿", "").replace("?", "")
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
-
-
-def normalize_option(text: str) -> str:
-    text = normalize_for_compare(text)
-    text = re.sub(r"^\s*(?:☐|□|•|o|\(\s*\)|\(\s*[xX]\s*\)|-)\s*", "", text)
-    text = re.sub(r"\s*[_\.]{3,}\s*$", "", text)
-    return text.strip(" .;:-")
-
-
-def safe_filename(name: str) -> str:
-    name = strip_accents(name)
-    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
-    return name.strip("_") or "archivo"
-
-
-def dedupe_preserve(items: List[str]) -> List[str]:
-    seen = set()
-    out = []
-    for item in items:
-        key = normalize_option(item)
-        if key and key not in seen:
-            seen.add(key)
-            out.append(item.strip())
-    return out
-
-
-# =========================================================
-# Extracción de texto PDF
-# =========================================================
-
-def extract_text_pymupdf(file_bytes: bytes) -> str:
-    parts = []
-    with fitz.open(stream=file_bytes, filetype="pdf") as doc:
-        for page in doc:
-            txt = page.get_text("text")
-            if txt:
-                parts.append(txt)
-    return norm("\n".join(parts))
-
-
-def extract_text_pypdf(file_bytes: bytes) -> str:
-    reader = PdfReader(io.BytesIO(file_bytes))
-    parts = []
-    for page in reader.pages:
-        txt = page.extract_text() or ""
-        if txt:
-            parts.append(txt)
-    return norm("\n".join(parts))
-
-
-def extract_pdf_text(file_bytes: bytes) -> str:
-    text = ""
-    try:
-        text = extract_text_pymupdf(file_bytes)
-    except Exception:
-        text = ""
-    if len(text.strip()) < 100:
-        try:
-            fallback = extract_text_pypdf(file_bytes)
-            if len(fallback.strip()) > len(text.strip()):
-                text = fallback
-        except Exception:
-            pass
-    return norm(text)
-
-
-# =========================================================
-# Modelo
-# =========================================================
-
-@dataclass
-class QuestionBlock:
-    qid: str
-    raw_header: str
-    question_text: str
-    options: List[str] = field(default_factory=list)
-    raw_block: str = ""
-
-
-@dataclass
-class SurveyDoc:
-    filename: str
-    survey_type: str
-    delegacion_codigo: str
-    delegacion_lugar: str
-    text: str
-    questions: Dict[str, QuestionBlock]
-
-
-# =========================================================
-# Identificación de tipo y delegación
-# =========================================================
-
-def identify_survey_type(text: str, filename: str = "") -> str:
-    base = normalize_for_compare(text[:2000] + " " + filename)
-    if "encuesta policial" in base or "percepcion institucional" in base:
-        return "Policial"
-    if "encuesta comercio" in base or "zona comercial" in base or "comerciod" in base:
-        return "Comercio"
-    if "encuesta comunidad" in base or "percepcion de comunidad" in base:
-        return "Comunidad"
-    if "policial" in base:
-        return "Policial"
-    if "comercio" in base:
-        return "Comercio"
-    return "Comunidad"
-
-
-def identify_delegacion(text: str, filename: str = "") -> Tuple[str, str]:
-    head = norm((text[:1500] + "\n" + filename).upper())
-    m = re.search(r"\bD\s*([0-9]{1,3})\b", head)
-    codigo = f"D{m.group(1)}" if m else "SIN_CODIGO"
-
-    lugar = "SIN_LUGAR"
-    lines = [x.strip() for x in head.splitlines() if x.strip()]
-
-    m2 = re.search(r"\bD\s*[0-9]{1,3}\s+([A-ZÁÉÍÓÚÜÑ ]{3,})", head)
-    if m2:
-        lugar = m2.group(1).strip()
-    else:
-        for ln in lines[:10]:
-            if re.fullmatch(r"[A-ZÁÉÍÓÚÜÑ ]{4,}", ln) and "ENCUESTA" not in ln and "ESTRATEGIA" not in ln:
-                if not re.search(r"\b(COMUNIDAD|COMERCIO|POLICIAL|CONSENTIMIENTO)\b", ln):
-                    lugar = ln.strip()
-                    break
-
-    lugar = re.sub(r"\s{2,}", " ", lugar)
-    return codigo, lugar.title()
-
-
-# =========================================================
-# Extracción de preguntas
-# =========================================================
-
-Q_START_RE = re.compile(r"(?m)^(?P<qid>\d{1,2}(?:\.\d+)?)\s*[\.\-–]\s*(?P<rest>.+)$")
-
-NOISE_PREFIXES = (
-    "nota", "nota previa", "nota condicional", "logica condicional", "lógica condicional",
-    "apartado ", "riesgos sociales", "victimizacion", "victimización", "delitos",
-    "propuestas ciudadanas", "confianza policial", "informacion adicional", "información adicional",
-    "programa seguridad comercial", "datos generales", "contexto territorial",
-    "informacion de condiciones", "información de condiciones"
-)
-
-
-def preprocess_question_text(text: str) -> str:
-    text = norm(text)
-    for i in range(1, 51):
-        text = text.replace(f"{i}- ", f"{i}. ")
-        text = text.replace(f"{i}-¿", f"{i}. ¿")
-        text = text.replace(f"{i}- ¿", f"{i}. ¿")
+def clean_for_compare(text: str) -> str:
+    if not text:
+        return ""
+    text = strip_accents(text.lower())
+    text = normalize_spaces(text)
+    text = text.replace("“", '"').replace("”", '"').replace("’", "'")
+    text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
-def split_question_blocks(text: str) -> List[Tuple[str, str]]:
-    text = preprocess_question_text(text)
-    matches = list(Q_START_RE.finditer(text))
-    blocks = []
-    for i, m in enumerate(matches):
-        start = m.start()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        blocks.append((m.group("qid"), text[start:end].strip()))
-    return blocks
+def similarity(a: str, b: str) -> float:
+    return SequenceMatcher(None, clean_for_compare(a), clean_for_compare(b)).ratio()
 
 
 def is_noise_line(line: str) -> bool:
-    raw = normalize_for_compare(line)
+    """
+    Ignora notas, instrucciones, encabezados, numeración de páginas, títulos globales.
+    """
+    raw = line.strip()
     if not raw:
         return True
-    if raw.startswith(NOISE_PREFIXES):
+
+    low = clean_for_compare(raw)
+
+    noise_prefixes = [
+        "nota:",
+        "nota.",
+        "nota previa",
+        "nota condicional",
+        "logica condicional",
+        "lógica condicional",
+        "consentimiento informado",
+        "estrategia sembremos seguridad",
+        "fin de la encuesta",
+        "datos generales de caracter estadistico",
+        "datos generales de carácter estadístico",
+        "informacion adicional y contacto voluntario",
+        "información adicional y contacto voluntario",
+        "propuestas ciudadanas para la mejora de la seguridad",
+        "confianza policial",
+        "delitos",
+        "victimizacion",
+        "victimización",
+        "riesgos sociales y situacionales",
+        "contexto territorial y problematicas",
+        "contexto territorial y problemáticas",
+        "informacion de condiciones institucionales",
+        "información de condiciones institucionales",
+    ]
+
+    if any(low.startswith(x) for x in noise_prefixes):
         return True
-    if raw in {"fin", "no hay respuestas correctas o incorrectas", "(recuerde, su informacion es confidencial.)"}:
+
+    # Encabezados de página o solo número de página
+    if re.fullmatch(r"\d+", low):
         return True
+
+    # Títulos grandes en mayúsculas sin ser pregunta
+    if len(raw) < 80 and raw.isupper() and "?" not in raw:
+        return True
+
     return False
 
 
-def is_scale_or_matrix_line(line: str) -> bool:
-    raw = normalize_for_compare(line)
-    if re.fullmatch(r"[0-9 ]{3,}", raw):
-        return True
-    if raw in {
-        "1 2 3 4 5", "1 2 3 4 5 6 7 8 9 10", "zona muy inseguro inseguro ni seguro ni inseguro seguro muy seguro no aplica"
-    }:
-        return True
-    if any(token in raw for token in ["muy inseguro", "ni seguro ni inseguro", "muy seguro", "no aplica"]):
-        return True
-    return False
+def normalize_option_text(text: str) -> str:
+    text = text.strip(" -•\t")
+    text = re.sub(r"^[\(\[]?\s*[xX ]?\s*[\)\]]\s*", "", text)
+    text = re.sub(r"^[oO]\s+", "", text)
+    text = re.sub(r"^[•●▪◦]\s*", "", text)
+    text = re.sub(r"^☐\s*", "", text)
+    text = re.sub(r"^\(\s*\)\s*", "", text)
+    text = re.sub(r"^\-\s*", "", text)
+    text = re.sub(r"\s+", " ", text).strip(" .;:")
+    return text.strip()
 
 
-def is_option_line(line: str) -> bool:
+# =========================================================
+# EXTRACCIÓN PDF
+# =========================================================
+def extract_pdf_text(file_obj) -> str:
+    try:
+        reader = PdfReader(file_obj)
+        pages = []
+        for page in reader.pages:
+            txt = page.extract_text() or ""
+            pages.append(txt)
+        return normalize_spaces("\n".join(pages))
+    except Exception:
+        return ""
+
+
+def detect_tipo(text: str, filename: str = "") -> str:
+    base = clean_for_compare((filename or "") + " " + (text[:1500] if text else ""))
+
+    if "encuesta policial" in base or "policial" in base:
+        return "Policial"
+    if "encuesta comercio" in base or "comercio" in base:
+        return "Comercio"
+    if "encuesta comunidad" in base or "comunidad" in base:
+        return "Comunidad"
+    return "Desconocido"
+
+
+def detect_delegacion(text: str, filename: str = "") -> str:
+    source = (filename or "") + "\n" + (text[:1500] if text else "")
+
+    # Busca D71 PUNTARENAS, D71 - PUNTARENAS, etc.
+    m = re.search(r"\bD\s*([0-9]{1,3})\b.*?\b([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ ]{2,})\b", source, re.DOTALL)
+    if m:
+        d = f"D{m.group(1)}"
+        place = m.group(2).strip()
+        place = re.sub(r"\s+", " ", place)
+        place = re.sub(r"(FORMATO|ENCUESTA|COMUNIDAD|COMERCIO|POLICIAL)$", "", place).strip()
+        if place:
+            return f"{d} - {place.title()}"
+
+    m2 = re.search(r"\bD\s*([0-9]{1,3})\b", source)
+    if m2:
+        return f"D{m2.group(1)}"
+
+    return "No identificada"
+
+
+# =========================================================
+# PARSER DE PREGUNTAS / OPCIONES
+# =========================================================
+QUESTION_RE = re.compile(
+    r"^\s*(\d{1,2}(?:\.\d+)?)[\.\-–]?\s*(.+)$"
+)
+
+OPTION_HINT_WORDS = [
+    "si",
+    "no",
+    "muy inseguro",
+    "inseguro",
+    "seguro",
+    "muy seguro",
+    "nunca",
+    "casi nunca",
+    "todos los dias",
+    "todos los días",
+    "varias veces",
+    "una vez",
+    "otro",
+    "otra",
+    "no aplica",
+    "desconocido",
+]
+
+
+def split_lines_safely(text: str) -> list[str]:
+    lines = []
+    for raw in text.split("\n"):
+        part = raw.strip()
+        if not part:
+            continue
+
+        # Si hay una pregunta pegada a otra, intenta separarlas
+        part = re.sub(r"(?<!^)\s+(\d{1,2}(?:\.\d+)?[\.\-–])\s*", r"\n\1 ", part)
+        for p in part.split("\n"):
+            p = p.strip()
+            if p:
+                lines.append(p)
+    return lines
+
+
+def is_question_line(line: str) -> bool:
+    if is_noise_line(line):
+        return False
+
+    m = QUESTION_RE.match(line)
+    if not m:
+        return False
+
+    q_text = m.group(2).strip()
+    low = clean_for_compare(q_text)
+
+    # filtra títulos sin forma de pregunta
+    if len(q_text) < 3:
+        return False
+
+    # si empieza con número y luego texto razonable, lo tomamos
+    return True
+
+
+def looks_like_option(line: str) -> bool:
+    if is_noise_line(line):
+        return False
+
     raw = line.strip()
-    if not raw or is_noise_line(raw):
-        return False
-    if is_scale_or_matrix_line(raw):
-        return False
-    lowered = normalize_for_compare(raw)
-    if re.match(r"^\s*(?:☐|□|•|o|\(\s*\)|\(\s*[xX]\s*\)|-)\s*", raw):
+    low = clean_for_compare(raw)
+
+    if raw.startswith(("☐", "•", "●", "▪", "◦")):
         return True
-    if raw.startswith("Otro:") or raw.startswith("Otro "):
+    if re.match(r"^\(\s*\)\s*", raw):
         return True
-    if lowered in {"si", "no", "no aplica", "no indica", "desconocido", "ninguno de los anteriores"}:
+    if re.match(r"^[oO]\s+", raw):
         return True
+
+    # líneas cortas debajo de una pregunta que parecen opción
+    if len(raw) <= 120 and any(word in low for word in OPTION_HINT_WORDS):
+        return True
+
     return False
 
 
-def clean_option_line(line: str) -> str:
-    line = norm(line)
-    line = re.sub(r"^\s*(?:☐|□|•|o|\(\s*\)|\(\s*[xX]\s*\)|-)\s*", "", line)
-    line = re.sub(r"\s*[_\.]{3,}\s*$", "", line)
-    return line.strip(" ;")
+def parse_questions(text: str) -> list[dict]:
+    lines = split_lines_safely(text)
 
+    questions = []
+    current = None
 
-def parse_question_block(qid: str, block: str) -> QuestionBlock:
-    lines = [ln.strip() for ln in norm(block).splitlines() if ln.strip()]
-    if not lines:
-        return QuestionBlock(qid=qid, raw_header=qid, question_text="", options=[], raw_block=block)
+    for line in lines:
+        if is_question_line(line):
+            m = QUESTION_RE.match(line)
+            q_num = m.group(1).strip()
+            q_text = m.group(2).strip()
 
-    header = re.sub(rf"^{re.escape(qid)}\s*[\.\-–]?\s*", "", lines[0]).strip()
-    question_lines = [header]
-    options = []
+            current = {
+                "num": q_num,
+                "question": q_text,
+                "options": []
+            }
+            questions.append(current)
+            continue
 
-    for line in lines[1:]:
+        if current is None:
+            continue
+
+        # Ignorar notas y ruido
         if is_noise_line(line):
             continue
-        if is_option_line(line):
-            options.append(clean_option_line(line))
-        elif not is_scale_or_matrix_line(line):
-            if options and len(line) < 90 and not re.match(r"^\d+(?:\.\d+)?", line):
-                options[-1] = f"{options[-1]} {clean_option_line(line)}".strip()
-            else:
-                question_lines.append(line)
 
-    question_text = " ".join(question_lines).strip()
-    question_text = re.sub(r"\s+", " ", question_text)
-    question_text = re.sub(r"\s*[_\.]{3,}\s*$", "", question_text)
-
-    # eliminar falsos positivos de matrices donde cada fila fue tomada como opción sin sentido
-    filtered_options = []
-    for opt in dedupe_preserve(options):
-        nopt = normalize_option(opt)
-        if not nopt or is_noise_line(opt) or is_scale_or_matrix_line(opt):
-            continue
-        if len(nopt) <= 1:
-            continue
-        filtered_options.append(opt)
-
-    return QuestionBlock(
-        qid=qid,
-        raw_header=header,
-        question_text=question_text,
-        options=filtered_options,
-        raw_block=block,
-    )
-
-
-def extract_questions(text: str) -> Dict[str, QuestionBlock]:
-    data: Dict[str, QuestionBlock] = {}
-    for qid, block in split_question_blocks(text):
-        qb = parse_question_block(qid, block)
-        if qb.question_text.strip():
-            data[qid] = qb
-    return data
-
-
-# =========================================================
-# Construcción de documento
-# =========================================================
-
-def build_survey_doc(filename: str, file_bytes: bytes) -> SurveyDoc:
-    text = extract_pdf_text(file_bytes)
-    survey_type = identify_survey_type(text, filename)
-    codigo, lugar = identify_delegacion(text, filename)
-    questions = extract_questions(text)
-    return SurveyDoc(
-        filename=filename,
-        survey_type=survey_type,
-        delegacion_codigo=codigo,
-        delegacion_lugar=lugar,
-        text=text,
-        questions=questions,
-    )
-
-
-# =========================================================
-# Comparación
-# =========================================================
-
-def smart_equal(a: str, b: str, threshold: int = 97) -> bool:
-    na = normalize_for_compare(a)
-    nb = normalize_for_compare(b)
-    if na == nb:
-        return True
-    return fuzz.ratio(na, nb) >= threshold
-
-
-def compare_options(old_opts: List[str], new_opts: List[str]) -> Tuple[List[str], List[str], List[Tuple[str, str]]]:
-    old_norm_map = {normalize_option(x): x for x in old_opts if normalize_option(x)}
-    new_norm_map = {normalize_option(x): x for x in new_opts if normalize_option(x)}
-
-    unmatched_old = dict(old_norm_map)
-    unmatched_new = dict(new_norm_map)
-    changed = []
-
-    for k in list(unmatched_old.keys()):
-        if k in unmatched_new:
-            unmatched_old.pop(k, None)
-            unmatched_new.pop(k, None)
-
-    used_new = set()
-    for ok, oval in list(unmatched_old.items()):
-        best_key = None
-        best_score = -1
-        for nk, nval in unmatched_new.items():
-            if nk in used_new:
-                continue
-            score = fuzz.ratio(ok, nk)
-            if score > best_score:
-                best_score = score
-                best_key = nk
-        if best_key is not None and best_score >= 84:
-            changed.append((oval, unmatched_new[best_key]))
-            used_new.add(best_key)
-            unmatched_old.pop(ok, None)
-
-    for nk in used_new:
-        unmatched_new.pop(nk, None)
-
-    removed = list(unmatched_old.values())
-    added = list(unmatched_new.values())
-    return removed, added, changed
-
-
-def compare_docs(original: SurveyDoc, modified: SurveyDoc) -> Dict:
-    result = {
-        "original": original,
-        "modified": modified,
-        "question_changes": [],
-        "new_questions": [],
-        "missing_questions": [],
-        "total_changes": 0,
-    }
-
-    oq = original.questions
-    mq = modified.questions
-    all_ids = sorted(set(oq.keys()) | set(mq.keys()), key=lambda x: [int(n) for n in re.findall(r"\d+", x)])
-
-    for qid in all_ids:
-        old = oq.get(qid)
-        new = mq.get(qid)
-
-        if old and not new:
-            result["missing_questions"].append({"qid": qid, "question": old.question_text})
-            continue
-        if new and not old:
-            result["new_questions"].append({"qid": qid, "question": new.question_text})
-            continue
-        if not old or not new:
+        # Si parece opción, agregarla
+        if looks_like_option(line):
+            opt = normalize_option_text(line)
+            if opt:
+                current["options"].append(opt)
             continue
 
-        question_text_changed = not smart_equal(old.question_text, new.question_text, threshold=98)
-        removed_opts, added_opts, changed_opts = compare_options(old.options, new.options)
+        # Si no es opción, pero la pregunta quedó partida en varias líneas,
+        # la concatenamos SOLO si no parece instrucción.
+        if current and len(line) < 220:
+            low = clean_for_compare(line)
+            if not low.startswith(("nota", "logica", "lógica", "si la respuesta", "en caso de", "al continuar")):
+                current["question"] = (current["question"] + " " + line).strip()
 
-        if question_text_changed or removed_opts or added_opts or changed_opts:
-            result["question_changes"].append({
-                "qid": qid,
-                "old_question": old.question_text,
-                "new_question": new.question_text,
-                "question_text_changed": question_text_changed,
-                "removed_options": removed_opts,
-                "added_options": added_opts,
-                "changed_options": changed_opts,
+    # limpieza final
+    cleaned = []
+    for q in questions:
+        q_text = re.sub(r"\s+", " ", q["question"]).strip()
+        opts = []
+        seen = set()
+
+        for op in q["options"]:
+            op2 = re.sub(r"\s+", " ", op).strip()
+            op_key = clean_for_compare(op2)
+            if op2 and op_key not in seen:
+                seen.add(op_key)
+                opts.append(op2)
+
+        if q_text:
+            cleaned.append({
+                "num": q["num"],
+                "question": q_text,
+                "options": opts
             })
 
-    result["total_changes"] = (
-        len(result["question_changes"]) + len(result["new_questions"]) + len(result["missing_questions"])
+    return cleaned
+
+
+# =========================================================
+# EMPAREJAMIENTO Y COMPARACIÓN
+# =========================================================
+def build_question_map(questions: list[dict]) -> dict:
+    return {q["num"]: q for q in questions}
+
+
+def compare_options(orig_opts: list[str], new_opts: list[str]) -> list[dict]:
+    changes = []
+
+    orig_norm = {clean_for_compare(x): x for x in orig_opts}
+    new_norm = {clean_for_compare(x): x for x in new_opts}
+
+    orig_keys = set(orig_norm.keys())
+    new_keys = set(new_norm.keys())
+
+    added = [new_norm[k] for k in sorted(new_keys - orig_keys)]
+    removed = [orig_norm[k] for k in sorted(orig_keys - new_keys)]
+
+    # Intentar detectar modificaciones cercanas entre eliminadas/agregadas
+    used_added = set()
+    used_removed = set()
+
+    for i, rem in enumerate(removed):
+        best_j = None
+        best_score = 0.0
+        for j, add in enumerate(added):
+            if j in used_added:
+                continue
+            sc = similarity(rem, add)
+            if sc > best_score:
+                best_score = sc
+                best_j = j
+
+        if best_j is not None and best_score >= 0.60:
+            changes.append({
+                "type": "opcion_modificada",
+                "antes": rem,
+                "despues": added[best_j]
+            })
+            used_removed.add(i)
+            used_added.add(best_j)
+
+    for i, rem in enumerate(removed):
+        if i not in used_removed:
+            changes.append({
+                "type": "opcion_eliminada",
+                "texto": rem
+            })
+
+    for j, add in enumerate(added):
+        if j not in used_added:
+            changes.append({
+                "type": "opcion_agregada",
+                "texto": add
+            })
+
+    return changes
+
+
+def compare_questions(orig_questions: list[dict], new_questions: list[dict]) -> list[dict]:
+    changes = []
+
+    orig_map = build_question_map(orig_questions)
+    new_map = build_question_map(new_questions)
+
+    all_nums = sorted(
+        set(orig_map.keys()) | set(new_map.keys()),
+        key=lambda x: [int(p) if p.isdigit() else p for p in re.split(r"(\d+)", x)]
     )
-    return result
+
+    for num in all_nums:
+        oq = orig_map.get(num)
+        nq = new_map.get(num)
+
+        if oq and not nq:
+            changes.append({
+                "question_num": num,
+                "question_label": f"Pregunta {num}",
+                "change_kind": "pregunta_eliminada",
+                "detail": f"La pregunta {num} existe en el original pero no aparece en el modificado."
+            })
+            continue
+
+        if nq and not oq:
+            changes.append({
+                "question_num": num,
+                "question_label": f"Pregunta {num}",
+                "change_kind": "pregunta_agregada",
+                "detail": f"Se agregó la pregunta {num}: {nq['question']}"
+            })
+            continue
+
+        # Ambas existen
+        q_changes = []
+
+        q_sim = similarity(oq["question"], nq["question"])
+        if q_sim < 0.97:
+            q_changes.append({
+                "type": "texto_pregunta_modificado",
+                "antes": oq["question"],
+                "despues": nq["question"]
+            })
+
+        opt_changes = compare_options(oq["options"], nq["options"])
+        q_changes.extend(opt_changes)
+
+        if q_changes:
+            changes.append({
+                "question_num": num,
+                "question_label": f"Pregunta {num}",
+                "change_kind": "detalle",
+                "question_original": oq["question"],
+                "question_new": nq["question"],
+                "changes": q_changes
+            })
+
+    return changes
 
 
 # =========================================================
-# PDF de salida
+# REPORTE PDF
 # =========================================================
-
-def build_report_pdf(comparisons: List[Dict]) -> bytes:
+def build_detailed_pdf(report_rows: list[dict]) -> bytes:
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
         buffer,
         pagesize=letter,
-        rightMargin=30,
-        leftMargin=30,
-        topMargin=34,
-        bottomMargin=30,
+        rightMargin=36,
+        leftMargin=36,
+        topMargin=36,
+        bottomMargin=36
     )
 
     styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="Small2", parent=styles["BodyText"], fontSize=8.5, leading=10.5, spaceAfter=2))
-    styles.add(ParagraphStyle(name="BoxTitle", parent=styles["Heading3"], fontSize=10.2, leading=12, spaceAfter=5, textColor=colors.HexColor("#12395b")))
-    styles.add(ParagraphStyle(name="Meta", parent=styles["BodyText"], fontSize=9, leading=11))
+    style_title = styles["Title"]
+    style_h2 = styles["Heading2"]
+    style_h3 = styles["Heading3"]
+    style_normal = styles["BodyText"]
 
-    elems = []
-    elems.append(Paragraph("Reporte comparativo de preguntas y opciones", styles["Title"]))
-    elems.append(Paragraph("Solo se muestran cambios sustantivos en preguntas y respuestas. Las notas, leyendas e instrucciones no se incluyen.", styles["Meta"]))
-    elems.append(Spacer(1, 0.16 * inch))
+    style_small = ParagraphStyle(
+        "small",
+        parent=styles["BodyText"],
+        fontSize=9,
+        leading=12,
+        spaceAfter=4
+    )
 
-    summary_data = [["Archivo", "Tipo", "Delegación", "Detalle"]]
-    for comp in comparisons:
-        mod = comp["modified"]
-        detalle = "Sin cambios" if comp["total_changes"] == 0 else f"{comp['total_changes']} cambio(s) con detalle"
-        summary_data.append([mod.filename, mod.survey_type, f"{mod.delegacion_codigo} - {mod.delegacion_lugar}", detalle])
+    style_box = ParagraphStyle(
+        "box",
+        parent=styles["BodyText"],
+        fontSize=9,
+        leading=12,
+        leftIndent=8,
+        spaceBefore=2,
+        spaceAfter=2
+    )
 
-    table = Table(summary_data, colWidths=[2.65 * inch, 0.9 * inch, 1.55 * inch, 1.35 * inch])
-    table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f4e78")),
+    story = []
+
+    story.append(Paragraph("Reporte comparativo de preguntas y opciones", style_title))
+    story.append(Spacer(1, 0.15 * inch))
+    story.append(Paragraph(
+        "Solo se incluyen cambios sustantivos en preguntas y respuestas. "
+        "No se incorporan notas, leyendas, instrucciones ni texto introductorio.",
+        style_normal
+    ))
+    story.append(Spacer(1, 0.25 * inch))
+
+    # Resumen
+    summary_data = [["Archivo", "Tipo", "Delegación", "Cambios detectados"]]
+    for row in report_rows:
+        summary_data.append([
+            row["archivo"],
+            row["tipo"],
+            row["delegacion"],
+            str(row["total_cambios"])
+        ])
+
+    tbl = Table(summary_data, repeatRows=1, colWidths=[180, 80, 110, 90])
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F4E79")),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("FONTSIZE", (0, 0), (-1, -1), 8.2),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.HexColor("#f3f6f9")]),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.lightgrey]),
     ]))
-    elems.append(table)
-    elems.append(PageBreak())
+    story.append(tbl)
+    story.append(Spacer(1, 0.3 * inch))
 
-    for idx, comp in enumerate(comparisons, 1):
-        mod = comp["modified"]
-        orig = comp["original"]
-        elems.append(Paragraph(f"{idx}. {html.escape(mod.filename)}", styles["Heading1"]))
-        elems.append(Paragraph(
-            f"<b>Tipo:</b> {mod.survey_type} &nbsp;&nbsp; <b>Delegación:</b> {mod.delegacion_codigo} - {html.escape(mod.delegacion_lugar)}<br/>"
-            f"<b>Original asociado:</b> {html.escape(orig.filename)}",
-            styles["Meta"],
+    # Detalle
+    for idx, row in enumerate(report_rows, start=1):
+        story.append(Paragraph(f"{idx}. {row['archivo']}", style_h2))
+        story.append(Paragraph(
+            f"<b>Tipo:</b> {row['tipo']} &nbsp;&nbsp;&nbsp; "
+            f"<b>Delegación:</b> {row['delegacion']} &nbsp;&nbsp;&nbsp; "
+            f"<b>Total de cambios:</b> {row['total_cambios']}",
+            style_small
         ))
-        elems.append(Spacer(1, 0.08 * inch))
+        story.append(Spacer(1, 0.08 * inch))
 
-        if comp["total_changes"] == 0:
-            elems.append(Paragraph("No se detectaron cambios en preguntas ni opciones de respuesta.", styles["BodyText"]))
-            if idx < len(comparisons):
-                elems.append(PageBreak())
+        if not row["cambios"]:
+            story.append(Paragraph("No se detectaron cambios sustantivos en preguntas u opciones.", style_small))
+            story.append(Spacer(1, 0.12 * inch))
             continue
 
-        for item in comp["new_questions"]:
-            elems.append(Paragraph(f"Pregunta nueva {item['qid']}", styles["BoxTitle"]))
-            elems.append(Paragraph(html.escape(item["question"]), styles["Small2"]))
-            elems.append(Spacer(1, 0.04 * inch))
+        for item in row["cambios"]:
+            story.append(Paragraph(item["question_label"], style_h3))
 
-        for item in comp["missing_questions"]:
-            elems.append(Paragraph(f"Pregunta ausente {item['qid']}", styles["BoxTitle"]))
-            elems.append(Paragraph(html.escape(item["question"]), styles["Small2"]))
-            elems.append(Spacer(1, 0.04 * inch))
+            if item["change_kind"] in ("pregunta_agregada", "pregunta_eliminada"):
+                story.append(Paragraph(item["detail"], style_box))
+                story.append(Spacer(1, 0.06 * inch))
+                continue
 
-        for ch in comp["question_changes"]:
-            elems.append(Paragraph(f"Pregunta {ch['qid']}", styles["BoxTitle"]))
-            if ch["question_text_changed"]:
-                elems.append(Paragraph(f"<b>Texto original:</b> {html.escape(ch['old_question'])}", styles["Small2"]))
-                elems.append(Paragraph(f"<b>Texto modificado:</b> {html.escape(ch['new_question'])}", styles["Small2"]))
-            for old_op, new_op in ch["changed_options"]:
-                elems.append(Paragraph(f"• <b>Opción modificada:</b> {html.escape(old_op)} <b>→</b> {html.escape(new_op)}", styles["Small2"]))
-            for op in ch["added_options"]:
-                elems.append(Paragraph(f"• <b>Opción agregada:</b> {html.escape(op)}", styles["Small2"]))
-            for op in ch["removed_options"]:
-                elems.append(Paragraph(f"• <b>Opción eliminada:</b> {html.escape(op)}", styles["Small2"]))
-            elems.append(Spacer(1, 0.06 * inch))
+            for ch in item["changes"]:
+                if ch["type"] == "texto_pregunta_modificado":
+                    story.append(Paragraph(
+                        f"<b>Texto modificado</b><br/>"
+                        f"<b>Original:</b> {ch['antes']}<br/>"
+                        f"<b>Nuevo:</b> {ch['despues']}",
+                        style_box
+                    ))
+                elif ch["type"] == "opcion_agregada":
+                    story.append(Paragraph(
+                        f"<b>Opción agregada:</b> {ch['texto']}",
+                        style_box
+                    ))
+                elif ch["type"] == "opcion_eliminada":
+                    story.append(Paragraph(
+                        f"<b>Opción eliminada:</b> {ch['texto']}",
+                        style_box
+                    ))
+                elif ch["type"] == "opcion_modificada":
+                    story.append(Paragraph(
+                        f"<b>Opción modificada</b><br/>"
+                        f"<b>Antes:</b> {ch['antes']}<br/>"
+                        f"<b>Después:</b> {ch['despues']}",
+                        style_box
+                    ))
 
-        if idx < len(comparisons):
-            elems.append(PageBreak())
+            story.append(Spacer(1, 0.06 * inch))
 
-    doc.build(elems)
-    return buffer.getvalue()
+        if idx < len(report_rows):
+            story.append(PageBreak())
+
+    doc.build(story)
+    pdf = buffer.getvalue()
+    buffer.close()
+    return pdf
 
 
 # =========================================================
 # UI
 # =========================================================
-
 st.title("Comparador de Formularios PDF")
-st.caption("Compara solo preguntas y opciones de respuesta. No toma en cuenta notas, leyendas ni instrucciones.")
-
-with st.expander("Qué detecta esta versión", expanded=False):
-    st.markdown(
-        """
-        - Cambios en el texto de la pregunta.
-        - Opciones agregadas.
-        - Opciones eliminadas.
-        - Opciones modificadas.
-        - Preguntas nuevas o ausentes.
-
-        No incluye notas, aclaraciones, leyendas ni texto de poca importancia.
-        """
-    )
+st.write(
+    "Cargue primero los **PDF originales** y luego los **PDF con cambios**. "
+    "La comparación se realiza solo sobre **preguntas y opciones de respuesta**."
+)
 
 col1, col2 = st.columns(2)
-with col1:
-    original_files = st.file_uploader("PDFs originales", type=["pdf"], accept_multiple_files=True, key="orig")
-with col2:
-    modified_files = st.file_uploader("PDFs modificados", type=["pdf"], accept_multiple_files=True, key="mod")
 
-compare_btn = st.button("Comparar formularios", type="primary", use_container_width=True)
+with col1:
+    st.subheader("1. PDF originales")
+    original_files = st.file_uploader(
+        "Cargue los originales",
+        type=["pdf"],
+        accept_multiple_files=True,
+        key="orig"
+    )
+
+with col2:
+    st.subheader("2. PDF modificados")
+    modified_files = st.file_uploader(
+        "Cargue los modificados",
+        type=["pdf"],
+        accept_multiple_files=True,
+        key="mod"
+    )
+
+compare_btn = st.button("Comparar formularios", type="primary")
+
+
+def build_reference_map(files: list) -> dict:
+    ref_map = {}
+    for f in files:
+        text = extract_pdf_text(f)
+        tipo = detect_tipo(text, f.name)
+        delegacion = detect_delegacion(text, f.name)
+        questions = parse_questions(text)
+
+        key = tipo.lower()
+        ref_map[key] = {
+            "filename": f.name,
+            "tipo": tipo,
+            "delegacion": delegacion,
+            "text": text,
+            "questions": questions
+        }
+    return ref_map
+
 
 if compare_btn:
     if not original_files or not modified_files:
-        st.error("Debe cargar al menos un PDF original y un PDF modificado.")
+        st.warning("Debe cargar los PDFs originales y los PDFs modificados.")
         st.stop()
 
-    with st.spinner("Leyendo PDFs y comparando preguntas/opciones..."):
-        originals = [build_survey_doc(f.name, f.getvalue()) for f in original_files]
-        modifieds = [build_survey_doc(f.name, f.getvalue()) for f in modified_files]
-        orig_by_type = {o.survey_type: o for o in originals}
+    with st.spinner("Procesando PDFs y comparando preguntas/opciones..."):
+        originals = build_reference_map(original_files)
 
-        comparisons = []
-        resumen_rows = []
+        report_rows = []
 
-        for mod in modifieds:
-            original = orig_by_type.get(mod.survey_type)
+        for f in modified_files:
+            text = extract_pdf_text(f)
+            tipo = detect_tipo(text, f.name)
+            delegacion = detect_delegacion(text, f.name)
+            questions = parse_questions(text)
+
+            original = originals.get(tipo.lower())
             if not original:
-                resumen_rows.append({
-                    "Archivo": mod.filename,
-                    "Tipo": mod.survey_type,
-                    "Delegación": f"{mod.delegacion_codigo} - {mod.delegacion_lugar}",
-                    "Resultado": "Sin original asociado",
+                report_rows.append({
+                    "archivo": f.name,
+                    "tipo": tipo,
+                    "delegacion": delegacion,
+                    "total_cambios": 0,
+                    "cambios": [],
+                    "error": "No se encontró original compatible."
                 })
                 continue
 
-            comp = compare_docs(original, mod)
-            comparisons.append(comp)
-            resumen_rows.append({
-                "Archivo": mod.filename,
-                "Tipo": mod.survey_type,
-                "Delegación": f"{mod.delegacion_codigo} - {mod.delegacion_lugar}",
-                "Resultado": "Sin cambios" if comp["total_changes"] == 0 else f"{comp['total_changes']} cambio(s) con detalle",
+            cambios = compare_questions(original["questions"], questions)
+
+            report_rows.append({
+                "archivo": f.name,
+                "tipo": tipo,
+                "delegacion": delegacion,
+                "total_cambios": len(cambios),
+                "cambios": cambios,
+                "error": None
             })
 
-    st.subheader("Resumen")
-    st.dataframe(resumen_rows, use_container_width=True, hide_index=True)
+    # ================= RESUMEN =================
+    st.subheader("Resumen general")
 
-    for comp in comparisons:
-        mod = comp["modified"]
-        with st.expander(f"{mod.survey_type} | {mod.delegacion_codigo} - {mod.delegacion_lugar} | {mod.filename}", expanded=True):
-            st.markdown(f"**Original asociado:** {comp['original'].filename}")
+    summary_df = pd.DataFrame([
+        {
+            "Archivo": r["archivo"],
+            "Tipo": r["tipo"],
+            "Delegación": r["delegacion"],
+            "Cambios detectados": r["total_cambios"]
+        }
+        for r in report_rows
+    ])
 
-            if comp["total_changes"] == 0:
-                st.success("No se detectaron cambios en preguntas ni opciones de respuesta.")
+    st.dataframe(summary_df, use_container_width=True)
+
+    # ================= DETALLE =================
+    st.subheader("Detalle de cambios")
+
+    for row in report_rows:
+        st.markdown("---")
+        st.markdown(f"### {row['archivo']}")
+        st.write(f"**Tipo:** {row['tipo']}")
+        st.write(f"**Delegación:** {row['delegacion']}")
+        st.write(f"**Total de cambios:** {row['total_cambios']}")
+
+        if row["error"]:
+            st.error(row["error"])
+            continue
+
+        if not row["cambios"]:
+            st.success("No se detectaron cambios sustantivos en preguntas u opciones.")
+            continue
+
+        for item in row["cambios"]:
+            st.markdown(f"#### {item['question_label']}")
+
+            if item["change_kind"] in ("pregunta_agregada", "pregunta_eliminada"):
+                st.warning(item["detail"])
                 continue
 
-            if comp["new_questions"]:
-                st.markdown("### Preguntas nuevas")
-                for item in comp["new_questions"]:
-                    st.markdown(f"**{item['qid']}** — {item['question']}")
+            for ch in item["changes"]:
+                if ch["type"] == "texto_pregunta_modificado":
+                    st.info("**Texto de la pregunta modificado**")
+                    st.write(f"**Original:** {ch['antes']}")
+                    st.write(f"**Nuevo:** {ch['despues']}")
 
-            if comp["missing_questions"]:
-                st.markdown("### Preguntas ausentes")
-                for item in comp["missing_questions"]:
-                    st.markdown(f"**{item['qid']}** — {item['question']}")
+                elif ch["type"] == "opcion_agregada":
+                    st.success(f"**Opción agregada:** {ch['texto']}")
 
-            if comp["question_changes"]:
-                st.markdown("### Cambios detectados por pregunta")
-                for ch in comp["question_changes"]:
-                    st.markdown(f"#### Pregunta {ch['qid']}")
-                    if ch["question_text_changed"]:
-                        st.markdown("**Texto original**")
-                        st.code(ch["old_question"])
-                        st.markdown("**Texto modificado**")
-                        st.code(ch["new_question"])
-                    if ch["changed_options"]:
-                        st.markdown("**Opciones modificadas**")
-                        for old_op, new_op in ch["changed_options"]:
-                            st.markdown(f"- `{old_op}` → `{new_op}`")
-                    if ch["added_options"]:
-                        st.markdown("**Opciones agregadas**")
-                        for op in ch["added_options"]:
-                            st.markdown(f"- {op}")
-                    if ch["removed_options"]:
-                        st.markdown("**Opciones eliminadas**")
-                        for op in ch["removed_options"]:
-                            st.markdown(f"- {op}")
+                elif ch["type"] == "opcion_eliminada":
+                    st.error(f"**Opción eliminada:** {ch['texto']}")
 
-    if comparisons:
-        pdf_bytes = build_report_pdf(comparisons)
-        st.download_button(
-            "Descargar reporte PDF detallado",
-            data=pdf_bytes,
-            file_name="reporte_comparativo_formularios_detallado.pdf",
-            mime="application/pdf",
-            use_container_width=True,
-        )
+                elif ch["type"] == "opcion_modificada":
+                    st.warning("**Opción modificada**")
+                    st.write(f"**Antes:** {ch['antes']}")
+                    st.write(f"**Después:** {ch['despues']}")
 
-        lines = []
-        for comp in comparisons:
-            mod = comp["modified"]
-            lines.append(f"ARCHIVO: {mod.filename}")
-            lines.append(f"TIPO: {mod.survey_type}")
-            lines.append(f"DELEGACION: {mod.delegacion_codigo} - {mod.delegacion_lugar}")
-            lines.append(f"TOTAL CAMBIOS: {comp['total_changes']}")
-            lines.append("-" * 90)
-            for item in comp["new_questions"]:
-                lines.append(f"PREGUNTA NUEVA {item['qid']}: {item['question']}")
-            for item in comp["missing_questions"]:
-                lines.append(f"PREGUNTA AUSENTE {item['qid']}: {item['question']}")
-            for ch in comp["question_changes"]:
-                lines.append(f"PREGUNTA {ch['qid']}")
-                if ch["question_text_changed"]:
-                    lines.append(f"  TEXTO ORIGINAL : {ch['old_question']}")
-                    lines.append(f"  TEXTO NUEVO    : {ch['new_question']}")
-                for old_op, new_op in ch["changed_options"]:
-                    lines.append(f"  OPCION MODIFICADA: {old_op} -> {new_op}")
-                for op in ch["added_options"]:
-                    lines.append(f"  OPCION AGREGADA : {op}")
-                for op in ch["removed_options"]:
-                    lines.append(f"  OPCION ELIMINADA: {op}")
-            lines.append("")
+    # ================= DESCARGA PDF =================
+    pdf_bytes = build_detailed_pdf(report_rows)
 
-        st.download_button(
-            "Descargar reporte TXT detallado",
-            data="\n".join(lines).encode("utf-8"),
-            file_name="reporte_comparativo_formularios_detallado.txt",
-            mime="text/plain",
-            use_container_width=True,
-        )
+    st.download_button(
+        "Descargar reporte PDF detallado",
+        data=pdf_bytes,
+        file_name="reporte_comparativo_preguntas_opciones.pdf",
+        mime="application/pdf"
+    )
