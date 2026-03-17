@@ -1,7 +1,6 @@
-pandas
-numpy
-openpyxl
-XlsxWriter
-matplotlib
-gspread
+streamlit
+pymupdf
+pypdf
+rapidfuzz
+reportlab
 
