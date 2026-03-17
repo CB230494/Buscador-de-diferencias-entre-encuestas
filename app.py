@@ -7,28 +7,29 @@ import unicodedata
 from difflib import SequenceMatcher
 from pathlib import Path
 
-import streamlit as st
 import pandas as pd
+import streamlit as st
 from pypdf import PdfReader
 
 from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
-from reportlab.lib.units import inch
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
 from reportlab.platypus import (
     SimpleDocTemplate,
     Paragraph,
     Spacer,
     Table,
     TableStyle,
-    PageBreak
+    KeepTogether,
+    PageBreak,
 )
 
 st.set_page_config(page_title="Comparador de Formularios PDF", layout="wide")
 
 
 # =========================================================
-# UTILIDADES
+# UTILIDADES GENERALES
 # =========================================================
 def strip_accents(text: str) -> str:
     if text is None:
@@ -50,8 +51,8 @@ def clean_for_compare(text: str) -> str:
     if not text:
         return ""
     text = strip_accents(text.lower())
-    text = normalize_spaces(text)
     text = text.replace("“", '"').replace("”", '"').replace("’", "'")
+    text = normalize_spaces(text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
@@ -60,11 +61,17 @@ def similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, clean_for_compare(a), clean_for_compare(b)).ratio()
 
 
+def safe_text(text: str) -> str:
+    if text is None:
+        return ""
+    return re.sub(r"\s+", " ", str(text)).strip()
+
+
+# =========================================================
+# FILTRO DE RUIDO
+# =========================================================
 def is_noise_line(line: str) -> bool:
-    """
-    Ignora notas, instrucciones, encabezados, numeración de páginas, títulos globales.
-    """
-    raw = line.strip()
+    raw = safe_text(line)
     if not raw:
         return True
 
@@ -94,17 +101,17 @@ def is_noise_line(line: str) -> bool:
         "contexto territorial y problemáticas",
         "informacion de condiciones institucionales",
         "información de condiciones institucionales",
+        "apartado a:",
+        "apartado b:",
     ]
 
     if any(low.startswith(x) for x in noise_prefixes):
         return True
 
-    # Encabezados de página o solo número de página
     if re.fullmatch(r"\d+", low):
         return True
 
-    # Títulos grandes en mayúsculas sin ser pregunta
-    if len(raw) < 80 and raw.isupper() and "?" not in raw:
+    if len(raw) < 90 and raw.isupper() and "?" not in raw:
         return True
 
     return False
@@ -138,7 +145,7 @@ def extract_pdf_text(file_obj) -> str:
 
 
 def detect_tipo(text: str, filename: str = "") -> str:
-    base = clean_for_compare((filename or "") + " " + (text[:1500] if text else ""))
+    base = clean_for_compare((filename or "") + " " + (text[:2000] if text else ""))
 
     if "encuesta policial" in base or "policial" in base:
         return "Policial"
@@ -150,9 +157,8 @@ def detect_tipo(text: str, filename: str = "") -> str:
 
 
 def detect_delegacion(text: str, filename: str = "") -> str:
-    source = (filename or "") + "\n" + (text[:1500] if text else "")
+    source = ((filename or "") + "\n" + (text[:2000] if text else "")).upper()
 
-    # Busca D71 PUNTARENAS, D71 - PUNTARENAS, etc.
     m = re.search(r"\bD\s*([0-9]{1,3})\b.*?\b([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ ]{2,})\b", source, re.DOTALL)
     if m:
         d = f"D{m.group(1)}"
@@ -170,15 +176,14 @@ def detect_delegacion(text: str, filename: str = "") -> str:
 
 
 # =========================================================
-# PARSER DE PREGUNTAS / OPCIONES
+# PARSER DE PREGUNTAS Y OPCIONES
 # =========================================================
-QUESTION_RE = re.compile(
-    r"^\s*(\d{1,2}(?:\.\d+)?)[\.\-–]?\s*(.+)$"
-)
+QUESTION_RE = re.compile(r"^\s*(\d{1,2}(?:\.\d+)?)[\.\-–]?\s*(.+)$")
 
 OPTION_HINT_WORDS = [
     "si",
     "no",
+    "sí",
     "muy inseguro",
     "inseguro",
     "seguro",
@@ -193,22 +198,31 @@ OPTION_HINT_WORDS = [
     "otra",
     "no aplica",
     "desconocido",
+    "arma",
+    "hurto",
+    "robo",
+    "asalto",
+    "estafa",
+    "extorsion",
+    "extorsión",
 ]
 
 
 def split_lines_safely(text: str) -> list[str]:
     lines = []
+
     for raw in text.split("\n"):
         part = raw.strip()
         if not part:
             continue
 
-        # Si hay una pregunta pegada a otra, intenta separarlas
         part = re.sub(r"(?<!^)\s+(\d{1,2}(?:\.\d+)?[\.\-–])\s*", r"\n\1 ", part)
+
         for p in part.split("\n"):
             p = p.strip()
             if p:
                 lines.append(p)
+
     return lines
 
 
@@ -221,13 +235,9 @@ def is_question_line(line: str) -> bool:
         return False
 
     q_text = m.group(2).strip()
-    low = clean_for_compare(q_text)
-
-    # filtra títulos sin forma de pregunta
     if len(q_text) < 3:
         return False
 
-    # si empieza con número y luego texto razonable, lo tomamos
     return True
 
 
@@ -245,8 +255,7 @@ def looks_like_option(line: str) -> bool:
     if re.match(r"^[oO]\s+", raw):
         return True
 
-    # líneas cortas debajo de una pregunta que parecen opción
-    if len(raw) <= 120 and any(word in low for word in OPTION_HINT_WORDS):
+    if len(raw) <= 140 and any(word in low for word in OPTION_HINT_WORDS):
         return True
 
     return False
@@ -275,33 +284,28 @@ def parse_questions(text: str) -> list[dict]:
         if current is None:
             continue
 
-        # Ignorar notas y ruido
         if is_noise_line(line):
             continue
 
-        # Si parece opción, agregarla
         if looks_like_option(line):
             opt = normalize_option_text(line)
             if opt:
                 current["options"].append(opt)
             continue
 
-        # Si no es opción, pero la pregunta quedó partida en varias líneas,
-        # la concatenamos SOLO si no parece instrucción.
-        if current and len(line) < 220:
-            low = clean_for_compare(line)
-            if not low.startswith(("nota", "logica", "lógica", "si la respuesta", "en caso de", "al continuar")):
-                current["question"] = (current["question"] + " " + line).strip()
+        low = clean_for_compare(line)
+        if not low.startswith(("nota", "logica", "lógica", "si la respuesta", "en caso de", "al continuar")):
+            if len(line) < 220:
+                current["question"] = safe_text(current["question"] + " " + line)
 
-    # limpieza final
     cleaned = []
     for q in questions:
-        q_text = re.sub(r"\s+", " ", q["question"]).strip()
+        q_text = safe_text(q["question"])
         opts = []
         seen = set()
 
         for op in q["options"]:
-            op2 = re.sub(r"\s+", " ", op).strip()
+            op2 = safe_text(op)
             op_key = clean_for_compare(op2)
             if op2 and op_key not in seen:
                 seen.add(op_key)
@@ -318,7 +322,7 @@ def parse_questions(text: str) -> list[dict]:
 
 
 # =========================================================
-# EMPAREJAMIENTO Y COMPARACIÓN
+# COMPARACIÓN
 # =========================================================
 def build_question_map(questions: list[dict]) -> dict:
     return {q["num"]: q for q in questions}
@@ -336,7 +340,6 @@ def compare_options(orig_opts: list[str], new_opts: list[str]) -> list[dict]:
     added = [new_norm[k] for k in sorted(new_keys - orig_keys)]
     removed = [orig_norm[k] for k in sorted(orig_keys - new_keys)]
 
-    # Intentar detectar modificaciones cercanas entre eliminadas/agregadas
     used_added = set()
     used_removed = set()
 
@@ -410,7 +413,6 @@ def compare_questions(orig_questions: list[dict], new_questions: list[dict]) -> 
             })
             continue
 
-        # Ambas existen
         q_changes = []
 
         q_sim = similarity(oq["question"], nq["question"])
@@ -442,124 +444,193 @@ def compare_questions(orig_questions: list[dict], new_questions: list[dict]) -> 
 # =========================================================
 def build_detailed_pdf(report_rows: list[dict]) -> bytes:
     buffer = io.BytesIO()
+
     doc = SimpleDocTemplate(
         buffer,
         pagesize=letter,
-        rightMargin=36,
-        leftMargin=36,
-        topMargin=36,
-        bottomMargin=36
+        rightMargin=28,
+        leftMargin=28,
+        topMargin=30,
+        bottomMargin=30,
     )
 
     styles = getSampleStyleSheet()
-    style_title = styles["Title"]
-    style_h2 = styles["Heading2"]
-    style_h3 = styles["Heading3"]
-    style_normal = styles["BodyText"]
 
-    style_small = ParagraphStyle(
-        "small",
+    style_title = ParagraphStyle(
+        "title_custom",
+        parent=styles["Title"],
+        fontName="Helvetica-Bold",
+        fontSize=18,
+        leading=22,
+        alignment=1,
+        spaceAfter=10,
+    )
+
+    style_intro = ParagraphStyle(
+        "intro_custom",
         parent=styles["BodyText"],
-        fontSize=9,
+        fontName="Helvetica",
+        fontSize=9.5,
         leading=12,
-        spaceAfter=4
+        alignment=0,
+        spaceAfter=10,
+    )
+
+    style_h2 = ParagraphStyle(
+        "h2_custom",
+        parent=styles["Heading2"],
+        fontName="Helvetica-Bold",
+        fontSize=13,
+        leading=16,
+        spaceBefore=6,
+        spaceAfter=6,
+    )
+
+    style_h3 = ParagraphStyle(
+        "h3_custom",
+        parent=styles["Heading3"],
+        fontName="Helvetica-BoldOblique",
+        fontSize=11,
+        leading=13,
+        spaceBefore=4,
+        spaceAfter=4,
+    )
+
+    style_meta = ParagraphStyle(
+        "meta_custom",
+        parent=styles["BodyText"],
+        fontName="Helvetica",
+        fontSize=9,
+        leading=11,
+        spaceAfter=6,
+        wordWrap="CJK",
     )
 
     style_box = ParagraphStyle(
-        "box",
+        "box_custom",
         parent=styles["BodyText"],
+        fontName="Helvetica",
         fontSize=9,
         leading=12,
         leftIndent=8,
+        rightIndent=4,
         spaceBefore=2,
-        spaceAfter=2
+        spaceAfter=2,
+        wordWrap="CJK",
     )
 
     story = []
 
     story.append(Paragraph("Reporte comparativo de preguntas y opciones", style_title))
-    story.append(Spacer(1, 0.15 * inch))
     story.append(Paragraph(
         "Solo se incluyen cambios sustantivos en preguntas y respuestas. "
         "No se incorporan notas, leyendas, instrucciones ni texto introductorio.",
-        style_normal
+        style_intro
     ))
-    story.append(Spacer(1, 0.25 * inch))
+    story.append(Spacer(1, 8))
 
-    # Resumen
     summary_data = [["Archivo", "Tipo", "Delegación", "Cambios detectados"]]
+
     for row in report_rows:
         summary_data.append([
-            row["archivo"],
-            row["tipo"],
-            row["delegacion"],
-            str(row["total_cambios"])
+            Paragraph(safe_text(row["archivo"]), style_meta),
+            Paragraph(safe_text(row["tipo"]), style_meta),
+            Paragraph(safe_text(row["delegacion"]), style_meta),
+            Paragraph(str(row["total_cambios"]), style_meta),
         ])
 
-    tbl = Table(summary_data, repeatRows=1, colWidths=[180, 80, 110, 90])
-    tbl.setStyle(TableStyle([
+    summary_table = Table(
+        summary_data,
+        repeatRows=1,
+        colWidths=[245, 90, 130, 75]
+    )
+
+    summary_table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F4E79")),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, -1), 9),
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("FONTSIZE", (0, 0), (-1, 0), 10),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
+        ("TOPPADDING", (0, 0), (-1, 0), 8),
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.lightgrey]),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.HexColor("#EDEDED")]),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
     ]))
-    story.append(tbl)
-    story.append(Spacer(1, 0.3 * inch))
 
-    # Detalle
+    story.append(summary_table)
+    story.append(Spacer(1, 14))
+
     for idx, row in enumerate(report_rows, start=1):
-        story.append(Paragraph(f"{idx}. {row['archivo']}", style_h2))
-        story.append(Paragraph(
-            f"<b>Tipo:</b> {row['tipo']} &nbsp;&nbsp;&nbsp; "
-            f"<b>Delegación:</b> {row['delegacion']} &nbsp;&nbsp;&nbsp; "
+        bloque_archivo = []
+
+        bloque_archivo.append(Paragraph(f"{idx}. {safe_text(row['archivo'])}", style_h2))
+        bloque_archivo.append(Paragraph(
+            f"<b>Tipo:</b> {safe_text(row['tipo'])} &nbsp;&nbsp;&nbsp; "
+            f"<b>Delegación:</b> {safe_text(row['delegacion'])} &nbsp;&nbsp;&nbsp; "
             f"<b>Total de cambios:</b> {row['total_cambios']}",
-            style_small
+            style_meta
         ))
-        story.append(Spacer(1, 0.08 * inch))
+        bloque_archivo.append(Spacer(1, 4))
+
+        if row["error"]:
+            bloque_archivo.append(Paragraph(f"<b>Error:</b> {safe_text(row['error'])}", style_box))
+            story.append(KeepTogether(bloque_archivo))
+            if idx < len(report_rows):
+                story.append(PageBreak())
+            continue
 
         if not row["cambios"]:
-            story.append(Paragraph("No se detectaron cambios sustantivos en preguntas u opciones.", style_small))
-            story.append(Spacer(1, 0.12 * inch))
+            bloque_archivo.append(
+                Paragraph("No se detectaron cambios sustantivos en preguntas u opciones.", style_box)
+            )
+            story.append(KeepTogether(bloque_archivo))
+            if idx < len(report_rows):
+                story.append(PageBreak())
             continue
 
         for item in row["cambios"]:
-            story.append(Paragraph(item["question_label"], style_h3))
+            bloque_pregunta = []
+            bloque_pregunta.append(Paragraph(safe_text(item["question_label"]), style_h3))
 
             if item["change_kind"] in ("pregunta_agregada", "pregunta_eliminada"):
-                story.append(Paragraph(item["detail"], style_box))
-                story.append(Spacer(1, 0.06 * inch))
+                bloque_pregunta.append(Paragraph(safe_text(item["detail"]), style_box))
+                bloque_pregunta.append(Spacer(1, 4))
+                bloque_archivo.append(KeepTogether(bloque_pregunta))
                 continue
 
             for ch in item["changes"]:
                 if ch["type"] == "texto_pregunta_modificado":
-                    story.append(Paragraph(
-                        f"<b>Texto modificado</b><br/>"
-                        f"<b>Original:</b> {ch['antes']}<br/>"
-                        f"<b>Nuevo:</b> {ch['despues']}",
-                        style_box
-                    ))
-                elif ch["type"] == "opcion_agregada":
-                    story.append(Paragraph(
-                        f"<b>Opción agregada:</b> {ch['texto']}",
-                        style_box
-                    ))
-                elif ch["type"] == "opcion_eliminada":
-                    story.append(Paragraph(
-                        f"<b>Opción eliminada:</b> {ch['texto']}",
-                        style_box
-                    ))
-                elif ch["type"] == "opcion_modificada":
-                    story.append(Paragraph(
-                        f"<b>Opción modificada</b><br/>"
-                        f"<b>Antes:</b> {ch['antes']}<br/>"
-                        f"<b>Después:</b> {ch['despues']}",
-                        style_box
-                    ))
+                    sub_bloque = [
+                        Paragraph("<b>Texto modificado</b>", style_box),
+                        Paragraph(f"<b>Original:</b> {safe_text(ch['antes'])}", style_box),
+                        Paragraph(f"<b>Nuevo:</b> {safe_text(ch['despues'])}", style_box),
+                    ]
+                    bloque_pregunta.append(KeepTogether(sub_bloque))
 
-            story.append(Spacer(1, 0.06 * inch))
+                elif ch["type"] == "opcion_agregada":
+                    bloque_pregunta.append(
+                        Paragraph(f"<b>Opción agregada:</b> {safe_text(ch['texto'])}", style_box)
+                    )
+
+                elif ch["type"] == "opcion_eliminada":
+                    bloque_pregunta.append(
+                        Paragraph(f"<b>Opción eliminada:</b> {safe_text(ch['texto'])}", style_box)
+                    )
+
+                elif ch["type"] == "opcion_modificada":
+                    sub_bloque = [
+                        Paragraph("<b>Opción modificada</b>", style_box),
+                        Paragraph(f"<b>Antes:</b> {safe_text(ch['antes'])}", style_box),
+                        Paragraph(f"<b>Después:</b> {safe_text(ch['despues'])}", style_box),
+                    ]
+                    bloque_pregunta.append(KeepTogether(sub_bloque))
+
+            bloque_pregunta.append(Spacer(1, 5))
+            bloque_archivo.append(KeepTogether(bloque_pregunta))
+
+        story.append(KeepTogether(bloque_archivo))
 
         if idx < len(report_rows):
             story.append(PageBreak())
@@ -571,7 +642,31 @@ def build_detailed_pdf(report_rows: list[dict]) -> bytes:
 
 
 # =========================================================
-# UI
+# LÓGICA DE ARMADO
+# =========================================================
+def build_reference_map(files: list) -> dict:
+    ref_map = {}
+
+    for f in files:
+        text = extract_pdf_text(f)
+        tipo = detect_tipo(text, f.name)
+        delegacion = detect_delegacion(text, f.name)
+        questions = parse_questions(text)
+
+        key = tipo.lower()
+        ref_map[key] = {
+            "filename": f.name,
+            "tipo": tipo,
+            "delegacion": delegacion,
+            "text": text,
+            "questions": questions,
+        }
+
+    return ref_map
+
+
+# =========================================================
+# INTERFAZ
 # =========================================================
 st.title("Comparador de Formularios PDF")
 st.write(
@@ -601,26 +696,6 @@ with col2:
 
 compare_btn = st.button("Comparar formularios", type="primary")
 
-
-def build_reference_map(files: list) -> dict:
-    ref_map = {}
-    for f in files:
-        text = extract_pdf_text(f)
-        tipo = detect_tipo(text, f.name)
-        delegacion = detect_delegacion(text, f.name)
-        questions = parse_questions(text)
-
-        key = tipo.lower()
-        ref_map[key] = {
-            "filename": f.name,
-            "tipo": tipo,
-            "delegacion": delegacion,
-            "text": text,
-            "questions": questions
-        }
-    return ref_map
-
-
 if compare_btn:
     if not original_files or not modified_files:
         st.warning("Debe cargar los PDFs originales y los PDFs modificados.")
@@ -628,7 +703,6 @@ if compare_btn:
 
     with st.spinner("Procesando PDFs y comparando preguntas/opciones..."):
         originals = build_reference_map(original_files)
-
         report_rows = []
 
         for f in modified_files:
@@ -638,6 +712,7 @@ if compare_btn:
             questions = parse_questions(text)
 
             original = originals.get(tipo.lower())
+
             if not original:
                 report_rows.append({
                     "archivo": f.name,
@@ -660,12 +735,11 @@ if compare_btn:
                 "error": None
             })
 
-    # ================= RESUMEN =================
     st.subheader("Resumen general")
 
     summary_df = pd.DataFrame([
         {
-            "Archivo": r["archivo"],
+            "Archivo": Path(r["archivo"]).name,
             "Tipo": r["tipo"],
             "Delegación": r["delegacion"],
             "Cambios detectados": r["total_cambios"]
@@ -675,7 +749,6 @@ if compare_btn:
 
     st.dataframe(summary_df, use_container_width=True)
 
-    # ================= DETALLE =================
     st.subheader("Detalle de cambios")
 
     for row in report_rows:
@@ -717,7 +790,6 @@ if compare_btn:
                     st.write(f"**Antes:** {ch['antes']}")
                     st.write(f"**Después:** {ch['despues']}")
 
-    # ================= DESCARGA PDF =================
     pdf_bytes = build_detailed_pdf(report_rows)
 
     st.download_button(
